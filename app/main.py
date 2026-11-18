@@ -20,7 +20,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
+from .badpixel import LIMITS as BADPIXEL_LIMITS
+from .badpixel import analyze_badpixels
+from .example import (
+    BADPIXEL_EXAMPLE_DESCRIPTION,
+    EXAMPLE_DESCRIPTION,
+    build_badpixel_example,
+    build_example_detections,
+    build_example_frames,
+)
 from .solver import InputConflict, solve_tracking
 
 MAX_FRAMES = 10
@@ -40,6 +48,7 @@ app = FastAPI(title="野生动物追踪串号校正与计数台")
 
 SESSIONS: dict[str, dict] = {}
 JOBS: dict[str, dict] = {}
+BADJOBS: dict[str, dict] = {}
 EXECUTOR = ThreadPoolExecutor(max_workers=4)
 
 
@@ -147,7 +156,11 @@ def _payload(sess: dict) -> dict:
         "detections": sess["detections"],
         "judgments": sess["judgments"],
         "params": sess["params"],
-        "limits": {"frames": MAX_FRAMES, "detections": MAX_DETECTIONS},
+        "limits": {
+            "frames": MAX_FRAMES,
+            "detections": MAX_DETECTIONS,
+            "badpixels": BADPIXEL_LIMITS,
+        },
     }
 
 
@@ -184,6 +197,16 @@ async def load_example():
     sess = _new_session(build_example_frames(), build_example_detections())
     out = _payload(sess)
     out["description"] = EXAMPLE_DESCRIPTION
+    return out
+
+
+@app.post("/api/example_badpixels")
+async def load_badpixel_example():
+    """创建内置坏点定位示例会话（5 帧连拍，埋入典型坐标）。"""
+    frames, dets = build_badpixel_example()
+    sess = _new_session(frames, dets)
+    out = _payload(sess)
+    out["description"] = BADPIXEL_EXAMPLE_DESCRIPTION
     return out
 
 
@@ -306,6 +329,40 @@ async def get_job(job_id: str):
     job = JOBS.get(job_id)
     if job is None:
         _err(404, "求解任务不存在。")
+    return job
+
+
+# ---------------------------------------------------------------- 坏点候选定位
+
+def _run_badjob(job_id: str, frames, detections):
+    try:
+        result = analyze_badpixels(frames, detections)
+        BADJOBS[job_id].update(status="done", result=result)
+    except Exception as exc:  # noqa: BLE001 - 任何分析异常都不能拖垮服务
+        BADJOBS[job_id].update(status="error", error=f"坏点分析内部错误：{exc}")
+
+
+@app.post("/api/sessions/{sid}/badpixels")
+async def start_badpixel(sid: str):
+    """启动异步坏点候选定位。任务记录启动时的输入版本，前端据此丢弃迟到结果。
+
+    分析只读取帧图与检测框，不修改会话；原图、轨迹与计数不受影响。
+    """
+    sess = _get_session(sid)
+    job_id = uuid.uuid4().hex[:12]
+    frames = list(sess["frames"])  # 会话内帧与检测框不可变，浅拷贝即可
+    detections = copy.deepcopy(sess["detections"])
+    BADJOBS[job_id] = {"status": "running", "version": sess["version"], "result": None, "error": None}
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(EXECUTOR, _run_badjob, job_id, frames, detections)
+    return {"job_id": job_id, "version": sess["version"]}
+
+
+@app.get("/api/badjobs/{job_id}")
+async def get_badjob(job_id: str):
+    job = BADJOBS.get(job_id)
+    if job is None:
+        _err(404, "坏点分析任务不存在。")
     return job
 
 

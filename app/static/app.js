@@ -20,6 +20,10 @@ const state = {
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  badpixLimits: { min_frames: 3, max_frames: 6, max_dim: 512 }, // 由会话 limits 覆盖
+  badpixels: null,        // 当前展示的坏点定位结果
+  badJobId: null,
+  badPollTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -73,6 +77,12 @@ function loadSession(payload) {
   state.result = null;
   state.jobId = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  // 切换会话：撤下旧坏点标记，丢弃在途分析结果
+  state.badpixels = null;
+  state.badJobId = null;
+  if (state.badPollTimer) { clearTimeout(state.badPollTimer); state.badPollTimer = null; }
+  state.badpixLimits =
+    (payload.limits && payload.limits.badpixels) || { min_frames: 3, max_frames: 6, max_dim: 512 };
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -130,6 +140,15 @@ async function loadExample() {
   }
 }
 
+async function loadBadpixelExample() {
+  try {
+    const payload = await api("/api/example_badpixels", { method: "POST" });
+    loadSession(payload);
+  } catch (err) {
+    showError("session-info", err);
+  }
+}
+
 /* ------------------------------------------------------------ 画面渲染 */
 
 function detsInFrame(f) {
@@ -162,6 +181,170 @@ function draw() {
     ctx.fillStyle = color;
     ctx.fillText(label, x + 3, ly + 12);
   }
+
+  drawBadpixelMarkers();
+}
+
+/* ------------------------------------------------------------ 坏点候选定位 */
+
+function drawBadpixelMarkers() {
+  const bp = state.badpixels;
+  if (!bp || !bp.candidates || bp.candidates.length === 0) return;
+  ctx.save();
+  bp.candidates.forEach((c, i) => {
+    const cx = c.x + 0.5;
+    const cy = c.y + 0.5;
+    const color = c.kind === "bright" ? "#ff6b57" : "#35c4ff";
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - 8, cy); ctx.lineTo(cx + 8, cy);
+    ctx.moveTo(cx, cy - 8); ctx.lineTo(cx, cy + 8);
+    ctx.stroke();
+    const label = String(i + 1);
+    ctx.font = "bold 10px sans-serif";
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(0,0,0,0.7)";
+    ctx.fillRect(cx + 7, cy - 17, tw + 5, 12);
+    ctx.fillStyle = color;
+    ctx.fillText(label, cx + 9.5, cy - 7.5);
+  });
+  ctx.restore();
+}
+
+function resetBadpixelPanel() {
+  const st = $("badpixel-status");
+  st.classList.add("muted");
+  st.style.color = "";
+  const lim = state.badpixLimits;
+  const n = state.nFrames;
+  const ok = state.sessionId && n >= lim.min_frames && n <= lim.max_frames;
+  $("badpixel-btn").disabled = !ok;
+  if (!state.sessionId) {
+    st.textContent = "请先创建会话。";
+  } else if (!ok) {
+    st.textContent =
+      `当前会话 ${n} 帧；坏点定位需要 ${lim.min_frames}~${lim.max_frames} 张` +
+      `同尺寸（≤${lim.max_dim}×${lim.max_dim}）连拍帧。`;
+  } else {
+    st.textContent = "尚未分析。分析只读取帧图与检测框，不改动原图、轨迹与计数。";
+  }
+  $("badpixel-result").innerHTML = "";
+  $("badpixel-clear").disabled = true;
+}
+
+function clearBadpixels() {
+  // 撤下旧标记；在途任务的迟到结果因 badJobId 置空而被丢弃
+  state.badpixels = null;
+  state.badJobId = null;
+  if (state.badPollTimer) { clearTimeout(state.badPollTimer); state.badPollTimer = null; }
+  resetBadpixelPanel();
+  draw();
+}
+
+async function runBadpixelCheck() {
+  if (!state.sessionId) return;
+  const sid = state.sessionId;
+  clearBadpixels(); // 重查即撤下旧标记
+  const st = $("badpixel-status");
+  st.classList.add("muted");
+  st.style.color = "";
+  st.textContent = "分析中…";
+  try {
+    const resp = await api(`/api/sessions/${sid}/badpixels`, { method: "POST" });
+    state.badJobId = resp.job_id;
+    st.textContent = `分析中（输入版本 v${resp.version}）…`;
+    pollBadJob(resp.job_id, sid);
+  } catch (err) {
+    showError("badpixel-status", err);
+  }
+}
+
+async function pollBadJob(jobId, sid) {
+  try {
+    const job = await api(`/api/badjobs/${jobId}`);
+    // 迟到结果：已重查或已切换会话，丢弃不覆盖当前画面
+    if (jobId !== state.badJobId || sid !== state.sessionId) return;
+    if (job.status === "running") {
+      state.badPollTimer = setTimeout(() => pollBadJob(jobId, sid), 300);
+      return;
+    }
+    if (job.status === "error") {
+      const st = $("badpixel-status");
+      st.textContent = job.error || "分析失败。";
+      st.classList.remove("muted");
+      st.style.color = "#ff9d97";
+      return;
+    }
+    state.badpixels = job.result;
+    renderBadpixels();
+    draw();
+  } catch (err) {
+    if (jobId !== state.badJobId || sid !== state.sessionId) return;
+    showError("badpixel-status", err);
+  }
+}
+
+function renderBadpixels() {
+  const bp = state.badpixels;
+  const st = $("badpixel-status");
+  const box = $("badpixel-result");
+  box.innerHTML = "";
+  if (!bp) return;
+  st.classList.remove("muted");
+  st.style.color =
+    bp.status === "ok" ? "#7ee2a0"
+    : bp.status === "clean" ? ""
+    : "#ffd887"; // insufficient / invalid
+  st.textContent = bp.message;
+
+  if (bp.problems && bp.problems.length > 0) {
+    const ul = document.createElement("ul");
+    ul.className = "bp-problems";
+    for (const p of bp.problems) {
+      const li = document.createElement("li");
+      li.textContent = p;
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+
+  if (bp.candidates && bp.candidates.length > 0) {
+    const ul = document.createElement("ul");
+    ul.className = "bp-list";
+    bp.candidates.forEach((c, i) => {
+      const li = document.createElement("li");
+      const dot = document.createElement("span");
+      dot.className = "bp-dot";
+      dot.style.background = c.kind === "bright" ? "#ff6b57" : "#35c4ff";
+      const txt = document.createElement("span");
+      txt.textContent =
+        `#${i + 1} 坐标 (${c.x}, ${c.y}) · ${c.kind === "bright" ? "持续偏亮" : "持续偏暗"}` +
+        ` · 偏差 ≈${c.strength}/255`;
+      li.append(dot, txt);
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+    const hint = document.createElement("div");
+    hint.className = "muted small";
+    hint.textContent = "标记已叠加在每一帧的相同坐标上（红=偏亮，蓝=偏暗）。";
+    box.appendChild(hint);
+  }
+
+  const sup = bp.suppressed || {};
+  const items = [["static", "背景静止"], ["occluded", "检测框遮挡"], ["patch", "异常连成片"]]
+    .filter(([k]) => sup[k] && sup[k].count > 0)
+    .map(([k, label]) => `${label} ${sup[k].count} 处`);
+  if (items.length > 0) {
+    const div = document.createElement("div");
+    div.className = "muted small";
+    div.textContent = `证据不足未列入：${items.join("、")}。`;
+    box.appendChild(div);
+  }
+  $("badpixel-clear").disabled = false;
 }
 
 function renderFrameNav() {
@@ -441,18 +624,22 @@ function renderAll() {
   banner.textContent = "尚无结果。";
   $("result-summary").innerHTML = "";
   $("trajectory-list").innerHTML = "";
+  resetBadpixelPanel();
 }
 
 /* ------------------------------------------------------------ 事件绑定 */
 
 $("upload-btn").addEventListener("click", uploadSession);
 $("example-btn").addEventListener("click", loadExample);
+$("example-bp-btn").addEventListener("click", loadBadpixelExample);
 $("prev-frame").addEventListener("click", () => switchFrame(-1));
 $("next-frame").addEventListener("click", () => switchFrame(1));
 $("mark-same").addEventListener("click", () => setJudgment("same"));
 $("mark-diff").addEventListener("click", () => setJudgment("different"));
 $("mark-clear").addEventListener("click", () => setJudgment(null));
 $("solve-btn").addEventListener("click", solve);
+$("badpixel-btn").addEventListener("click", runBadpixelCheck);
+$("badpixel-clear").addEventListener("click", clearBadpixels);
 canvas.addEventListener("click", onCanvasClick);
 for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
   $(id).addEventListener("change", applyParams);

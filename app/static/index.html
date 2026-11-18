@@ -25,6 +25,7 @@
       <div class="btn-row">
         <button id="upload-btn">上传并创建会话</button>
         <button id="example-btn" class="secondary">加载交叉遮挡示例</button>
+        <button id="example-bp-btn" class="secondary">加载坏点定位示例</button>
       </div>
       <div id="session-info" class="muted">尚未创建会话。</div>
     </section>
@@ -80,6 +81,22 @@
       <div id="result-banner" class="banner muted">尚无结果。</div>
       <div id="result-summary"></div>
       <div id="trajectory-list"></div>
+    </section>
+
+    <section class="card" id="badpixel-card">
+      <h2>5. 坏点候选定位（传感器自检）</h2>
+      <div class="muted small">
+        针对当前会话 3~6 张同尺寸（≤512×512）连拍帧：仅当某坐标在各帧持续孤立偏亮/偏暗、
+        邻域随拍摄有可辨变化、且不被检测框遮挡时，才列为待检坐标并在原图上叠加标记；
+        背景静止、检测框遮挡或异常连成片时只提示证据不足，不猜测坏点。
+        分析不改动原图、轨迹与计数。
+      </div>
+      <div class="btn-row">
+        <button id="badpixel-btn" disabled>定位坏点候选</button>
+        <button id="badpixel-clear" class="secondary" disabled>撤下标记</button>
+      </div>
+      <div id="badpixel-status" class="muted small">请先创建会话。</div>
+      <div id="badpixel-result"></div>
     </section>
   </main>
 </div>

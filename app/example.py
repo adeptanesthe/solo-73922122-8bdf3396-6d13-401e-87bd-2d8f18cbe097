@@ -17,6 +17,7 @@ import io
 import math
 import random
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 WIDTH, HEIGHT = 320, 240
@@ -106,4 +107,60 @@ EXAMPLE_DESCRIPTION = (
     "交叉遮挡示例：A（红）与 B（蓝）相向穿行，第 3 帧 B 被 A 遮挡缺失检测、"
     "A 的外观被污染。正确结果应为 2 条轨迹（2 只动物）；"
     "若只按最近邻逐帧贪心，容易在交汇点串号或把 B 断成两条而重复计数。"
+)
+
+
+# ---------------------------------------------------------------- 坏点定位示例
+
+BP_W, BP_H, BP_N = 220, 160, 5
+BP_HOT = (70, 50)      # 持续偏亮 → 应列为候选
+BP_DARK = (160, 110)   # 持续偏暗 → 应列为候选
+BP_PATCH = (120, 30)   # 2×2 连片亮斑 → 证据不足（异常连成片）
+BP_OCC = (30, 130)     # 部分帧被检测框遮挡的亮点 → 证据不足（检测框遮挡）
+BP_STATIC = (9, 9)     # 静止角落里的亮点 → 证据不足（背景静止）
+BP_OCC_RECT = [24, 124, 14, 14]  # 第 1、3 帧遮挡 BP_OCC 的检测框
+
+
+def build_badpixel_example():
+    """5 帧 220×160 灰度连拍：背景随帧移动，埋入各类典型坐标。
+
+    返回 (frames, detections)。用于在网页上直接验证坏点候选定位的
+    各条判定路径（候选 / 背景静止 / 检测框遮挡 / 异常连成片）。
+    """
+    rng = np.random.default_rng(20261118)
+    yy, xx = np.mgrid[0:BP_H, 0:BP_W]
+    frames = []
+    static_corner = None
+    for f in range(BP_N):
+        base = 110 + 40 * np.sin((xx + 9 * f) / 23.0) + 30 * np.cos((yy - 7 * f) / 29.0)
+        base += rng.normal(0.0, 2.0, (BP_H, BP_W))
+        if f == 0:
+            static_corner = base[:18, :18].copy()
+        base[:18, :18] = static_corner  # 左上角各帧完全一致（静止背景）
+        arr = np.clip(base, 0, 255).astype(np.float32)
+        arr[BP_STATIC[1], BP_STATIC[0]] = 240.0
+        arr[BP_HOT[1], BP_HOT[0]] = 250.0
+        arr[BP_DARK[1], BP_DARK[0]] = 4.0
+        arr[BP_PATCH[1]:BP_PATCH[1] + 2, BP_PATCH[0]:BP_PATCH[0] + 2] = 246.0
+        arr[BP_OCC[1], BP_OCC[0]] = 250.0
+        img = Image.fromarray(arr.astype(np.uint8), mode="L")
+        if f in (1, 3):
+            # 遮挡物经过 BP_OCC（对应检测框区域）
+            x, y, w, h = BP_OCC_RECT
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([x, y, x + w, y + h], fill=150)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        frames.append(("image/png", buf.getvalue()))
+    dets = [
+        {"id": "occ1", "frame": 1, "rect": list(BP_OCC_RECT), "vector": [1.0, 0.0]},
+        {"id": "occ2", "frame": 3, "rect": list(BP_OCC_RECT), "vector": [1.0, 0.0]},
+    ]
+    return frames, dets
+
+
+BADPIXEL_EXAMPLE_DESCRIPTION = (
+    "坏点定位示例：5 帧连拍，背景随帧变化。埋入 (70,50) 持续偏亮与 (160,110) "
+    "持续偏暗两枚模拟坏点；另有静止角落亮点、2×2 连片亮斑、被检测框部分遮挡的"
+    "亮点各一处（这三类应判为“证据不足”）。请点“5. 坏点候选定位”验证。"
 )
